@@ -60,13 +60,7 @@ optuna_samplers_dict = {
     "QMCSampler": optuna.samplers.QMCSampler,
 }
 
-log_queue: Any | None = None
-
-
-def _require_log_queue() -> "Queue[Any]":
-    if log_queue is None:
-        raise OperationalException("Logging queue not initialized.")
-    return cast("Queue[Any]", log_queue)
+_log_manager: Any | None = None
 
 
 class HyperOptimizer:
@@ -88,6 +82,7 @@ class HyperOptimizer:
         self.pairlist = self.backtesting.pairlists.whitelist
         self.custom_hyperopt: HyperOptAuto
         self.analyze_per_epoch = self.config.get("analyze_per_epoch", False)
+        self._log_queue: Queue[Any] | None = None
 
         self.custom_hyperopt = HyperOptAuto(self.config)
 
@@ -113,22 +108,27 @@ class HyperOptimizer:
             self.config["use_exit_signal"] = True
         self._setup_logging_mp_workaround()
 
+    def _require_log_queue(self) -> Queue[Any]:
+        if self._log_queue is None:
+            raise OperationalException("Logging queue not initialized.")
+        return self._log_queue
+
     def _setup_logging_mp_workaround(self) -> None:
         """
         Workaround for logging in child processes.
         local_queue must be a global and passed to the child process via inheritance.
         """
-        global log_queue
-        m = Manager()
-        log_queue = m.Queue()
-        logger.info(f"manager queue {type(log_queue)}")
+        global _log_manager
+        _log_manager = Manager()
+        self._log_queue = cast(Queue[Any], _log_manager.Queue())
+        logger.info(f"manager queue {type(self._log_queue)}")
 
     def handle_mp_logging(self) -> None:
         """
         Handle logging from child processes.
         Must be called in the parent process to handle log messages from the child process.
         """
-        logging_mp_handle(_require_log_queue())
+        logging_mp_handle(self._require_log_queue())
 
     def prepare_hyperopt(self) -> None:
         # Initialize spaces ...
@@ -266,7 +266,8 @@ class HyperOptimizer:
     @wrap_non_picklable_objects
     def generate_optimizer_wrapped(self, params_dict: dict[str, Any]) -> dict[str, Any]:
         logging_mp_setup(
-            _require_log_queue(), logging.INFO if self.config["verbosity"] < 1 else logging.DEBUG
+            self._require_log_queue(),
+            logging.INFO if self.config["verbosity"] < 1 else logging.DEBUG,
         )
         return self.generate_optimizer(params_dict)
 
