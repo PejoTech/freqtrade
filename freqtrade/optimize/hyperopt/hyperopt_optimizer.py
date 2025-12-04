@@ -7,9 +7,9 @@ import logging
 import sys
 import warnings
 from datetime import UTC, datetime
-from multiprocessing import Manager
+from multiprocessing import Manager, Queue
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import optuna
 from joblib import delayed, dump, load, wrap_non_picklable_objects
@@ -60,7 +60,13 @@ optuna_samplers_dict = {
     "QMCSampler": optuna.samplers.QMCSampler,
 }
 
-log_queue: Any
+log_queue: Any | None = None
+
+
+def _require_log_queue() -> "Queue[Any]":
+    if log_queue is None:
+        raise OperationalException("Logging queue not initialized.")
+    return cast("Queue[Any]", log_queue)
 
 
 class HyperOptimizer:
@@ -122,7 +128,7 @@ class HyperOptimizer:
         Handle logging from child processes.
         Must be called in the parent process to handle log messages from the child process.
         """
-        logging_mp_handle(log_queue)
+        logging_mp_handle(_require_log_queue())
 
     def prepare_hyperopt(self) -> None:
         # Initialize spaces ...
@@ -259,7 +265,9 @@ class HyperOptimizer:
     @delayed
     @wrap_non_picklable_objects
     def generate_optimizer_wrapped(self, params_dict: dict[str, Any]) -> dict[str, Any]:
-        logging_mp_setup(log_queue, logging.INFO if self.config["verbosity"] < 1 else logging.DEBUG)
+        logging_mp_setup(
+            _require_log_queue(), logging.INFO if self.config["verbosity"] < 1 else logging.DEBUG
+        )
         return self.generate_optimizer(params_dict)
 
     def generate_optimizer(self, params_dict: dict[str, Any]) -> dict[str, Any]:
@@ -312,10 +320,12 @@ class HyperOptimizer:
             self.backtesting.strategy.max_open_trades = updated_max_open_trades
 
         with self.data_pickle_file.open("rb") as f:
-            processed = load(f, mmap_mode="r")
-        if self.analyze_per_epoch:
-            # Data is not yet analyzed, rerun populate_indicators.
-            processed = self.advise_and_trim(processed)
+            raw_data = load(f, mmap_mode="r")
+
+        # Always (re-)calculate indicators and signals with the current parameter set.
+        # Preprocessing cached during prepare_hyperopt_data does not reflect trial-specific
+        # parameter values and would therefore produce identical results across epochs.
+        processed = self.advise_and_trim(raw_data)
 
         bt_results = self.backtesting.backtest(
             processed=processed, start_date=self.min_date, end_date=self.max_date
@@ -455,18 +465,17 @@ class HyperOptimizer:
         data, self.timerange = self.backtesting.load_bt_data()
         logger.info("Dataload complete. Calculating indicators")
 
-        if not self.analyze_per_epoch:
-            HyperoptStateContainer.set_state(HyperoptState.INDICATORS)
+        # Calculate indicators once to determine timerange/market change for logging.
+        # The actual optimization run will re-run indicator calculations for each trial
+        # to honor changing hyperopt parameters.
+        HyperoptStateContainer.set_state(HyperoptState.INDICATORS)
+        self.advise_and_trim(data)
 
-            preprocessed = self.advise_and_trim(data)
-
-            logger.info(
-                f"Hyperopting with data from "
-                f"{self.min_date.strftime(DATETIME_PRINT_FORMAT)} "
-                f"up to {self.max_date.strftime(DATETIME_PRINT_FORMAT)} "
-                f"({(self.max_date - self.min_date).days} days).."
-            )
-            # Store non-trimmed data - will be trimmed after signal generation.
-            dump(preprocessed, self.data_pickle_file)
-        else:
-            dump(data, self.data_pickle_file)
+        logger.info(
+            f"Hyperopting with data from "
+            f"{self.min_date.strftime(DATETIME_PRINT_FORMAT)} "
+            f"up to {self.max_date.strftime(DATETIME_PRINT_FORMAT)} "
+            f"({(self.max_date - self.min_date).days} days).."
+        )
+        # Store raw data - indicators/signals are recomputed per epoch.
+        dump(data, self.data_pickle_file)
