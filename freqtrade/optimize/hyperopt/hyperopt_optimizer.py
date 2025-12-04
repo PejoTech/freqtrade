@@ -3,6 +3,8 @@ This module contains the hyperopt optimizer class, which needs to be pickled
 and will be sent to the hyperopt worker processes.
 """
 
+from __future__ import annotations
+
 import logging
 import sys
 import warnings
@@ -120,7 +122,7 @@ class HyperOptimizer:
         """
         global _log_manager
         _log_manager = Manager()
-        self._log_queue = cast(Queue[Any], _log_manager.Queue())
+        self._log_queue = cast("Queue[Any]", _log_manager.Queue())
         logger.info(f"manager queue {type(self._log_queue)}")
 
     def handle_mp_logging(self) -> None:
